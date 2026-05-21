@@ -30,8 +30,8 @@ from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
     AnalysisResult,
-    fill_chip_structure_if_needed,
     fill_price_position_if_needed,
+    normalize_chip_structure_availability,
     stabilize_decision_with_structure,
 )
 from src.data.stock_mapping import STOCK_NAME_MAP
@@ -84,6 +84,7 @@ class StockAnalysisPipeline:
         query_source: Optional[str] = None,
         save_context_snapshot: Optional[bool] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
+        analysis_skills: Optional[List[str]] = None,
     ):
         """
         初始化调度器
@@ -101,13 +102,14 @@ class StockAnalysisPipeline:
             self.config.save_context_snapshot if save_context_snapshot is None else save_context_snapshot
         )
         self.progress_callback = progress_callback
+        self.analysis_skills = list(analysis_skills) if analysis_skills is not None else None
         
         # 初始化各模块
         self.db = get_db()
         self.fetcher_manager = DataFetcherManager()
         # 不再单独创建 akshare_fetcher，统一使用 fetcher_manager 获取增强数据
         self.trend_analyzer = StockTrendAnalyzer()  # 技术分析器
-        self.analyzer = GeminiAnalyzer(config=self.config)
+        self.analyzer = GeminiAnalyzer(config=self.config, skills=self.analysis_skills)
         self.notifier = NotificationService(source_message=source_message)
         self._single_stock_notify_lock = threading.Lock()
         
@@ -312,6 +314,10 @@ class StockAnalysisPipeline:
             # switched to Agent mode (which is slower and more expensive).
             use_agent = getattr(self.config, 'agent_mode', False)
             if not use_agent:
+                if self.analysis_skills:
+                    use_agent = True
+                    logger.info(f"{stock_name}({code}) Auto-enabled agent mode due to request skills: {self.analysis_skills}")
+            if not use_agent:
                 # Auto-enable agent mode when specific skills are configured (e.g., scheduled task with strategy)
                 configured_skills = getattr(self.config, 'agent_skills', [])
                 if configured_skills and configured_skills != ['all']:
@@ -498,9 +504,9 @@ class StockAnalysisPipeline:
                 result.current_price = realtime_data.get('price')
                 result.change_pct = realtime_data.get('change_pct')
 
-            # Step 7.6: chip_structure fallback (Issue #589)
-            if result and chip_data:
-                fill_chip_structure_if_needed(result, chip_data)
+            # Step 7.6: chip_structure fallback (Issue #589) and unavailable collapse
+            if result:
+                normalize_chip_structure_availability(result, chip_data)
 
             # Step 7.7: price_position fallback
             if result:
@@ -790,8 +796,13 @@ class StockAnalysisPipeline:
             from src.agent.factory import build_agent_executor
             report_language = normalize_report_language(getattr(self.config, "report_language", "zh"))
 
+            requested_skills = (
+                self.analysis_skills
+                if self.analysis_skills is not None
+                else (getattr(self.config, 'agent_skills', None) or None)
+            )
             # Build executor from shared factory (ToolRegistry and SkillManager prototype are cached)
-            executor = build_agent_executor(self.config, getattr(self.config, 'agent_skills', None) or None)
+            executor = build_agent_executor(self.config, requested_skills)
 
             # Build initial context to avoid redundant tool calls
             initial_context = {
@@ -801,6 +812,8 @@ class StockAnalysisPipeline:
                 "report_language": report_language,
                 "fundamental_context": fundamental_context,
             }
+            if self.analysis_skills is not None:
+                initial_context["skills"] = self.analysis_skills
             
             if realtime_quote:
                 initial_context["realtime_quote"] = self._safe_to_dict(realtime_quote)
@@ -858,8 +871,8 @@ class StockAnalysisPipeline:
                         missing,
                     )
             # chip_structure fallback (Issue #589), before save_analysis_history
-            if result and chip_data:
-                fill_chip_structure_if_needed(result, chip_data)
+            if result and chip_data is not None:
+                normalize_chip_structure_availability(result, chip_data)
 
             # price_position fallback (same as non-agent path Step 7.7)
             if result:
@@ -1518,12 +1531,15 @@ class StockAnalysisPipeline:
         """
         构建分析上下文快照
         """
-        return {
+        snapshot = {
             "enhanced_context": enhanced_context,
             "news_content": news_content,
             "realtime_quote_raw": self._safe_to_dict(realtime_quote),
             "chip_distribution_raw": self._safe_to_dict(chip_data),
         }
+        if self.analysis_skills is not None:
+            snapshot["skills"] = list(self.analysis_skills)
+        return snapshot
 
     @staticmethod
     def _resolve_resume_target_date(
